@@ -69,9 +69,10 @@ class MCPClient:
         self._logger.info("mcp_tool_calling", tool=name, arguments=arguments)
         async with Client(self._server_script) as client:
             result = await client.call_tool(name, arguments)
-            # FastMCP returns a list of content blocks; extract text
+            # FastMCP CallToolResult has .content list of content blocks
+            blocks = result.content if hasattr(result, "content") else (result if isinstance(result, list) else [])
             text = ""
-            for block in result:
+            for block in blocks:
                 if hasattr(block, "text"):
                     text += block.text
             self._logger.info("mcp_tool_result", tool=name, length=len(text))
