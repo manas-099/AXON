@@ -105,23 +105,60 @@ class LLMAdapterError(Exception):
 
 class LLMAdapter(BaseLLMAdapter):
     """
-    Concrete adapter for a self-hosted OpenAI-compatible LLM endpoint.
-    Handles: generate(), stream(), retry logic, health tracking.
-    Import via LLMFactory.create() — never instantiate directly.
+    Concrete adapter for an OpenAI-compatible LLM endpoint with automatic fallback.
+    If the primary LLM (e.g. Groq) encounters an error, it seamlessly switches to
+    the configured backup LLM (e.g. OpenRouter) so execution is never disrupted.
     """
 
-    def __init__(self) -> None:
+    def register_tools(self, tools: list[ToolSchema]) -> None:
+        """Register tools with both primary and backup adapters."""
+        super().register_tools(tools)
+        if self._backup_adapter:
+            self._backup_adapter.register_tools(tools)
+
+    def __init__(
+        self,
+        api_url: str | None = None,
+        auth_token: str | None = None,
+        model_name: str | None = None,
+        timeout_seconds: int = 60,
+        max_retries: int = 3,
+        retry_delay_seconds: float = 2.0,
+        provider: str = "my_llm",
+    ) -> None:
         settings = get_settings()
-        super().__init__(
-            model_name = settings.my_llm.MODEL_NAME,
-            provider   = "my_llm",
-        )
-        self._settings = settings.my_llm
-        self._health   = _HealthState(self._settings.HEALTH_CHECK_COOLDOWN_SECONDS)
+        target_model = model_name or settings.my_llm.MODEL_NAME
+        super().__init__(model_name=target_model, provider=provider)
+        
+        self._api_url = api_url or settings.my_llm.API_URL
+        self._auth_token = auth_token or settings.my_llm.AUTH_TOKEN
+        self._timeout_seconds = timeout_seconds if api_url else settings.my_llm.TIMEOUT_SECONDS
+        self._max_retries = max_retries if api_url else settings.my_llm.MAX_RETRIES
+        self._retry_delay_seconds = retry_delay_seconds if api_url else settings.my_llm.RETRY_DELAY_SECONDS
+        self._health = _HealthState(settings.my_llm.HEALTH_CHECK_COOLDOWN_SECONDS)
+
+        # Initialize backup adapter if enabled
+        self._backup_adapter: LLMAdapter | None = None
+        if provider != "backup_llm" and settings.backup_llm.ENABLED and settings.backup_llm.AUTH_TOKEN:
+            self._backup_adapter = LLMAdapter(
+                api_url=settings.backup_llm.API_URL,
+                auth_token=settings.backup_llm.AUTH_TOKEN,
+                model_name=settings.backup_llm.MODEL_NAME,
+                timeout_seconds=settings.backup_llm.TIMEOUT_SECONDS,
+                max_retries=settings.backup_llm.MAX_RETRIES,
+                retry_delay_seconds=settings.backup_llm.RETRY_DELAY_SECONDS,
+                provider="backup_llm",
+            )
+            self._logger.info(
+                "backup_llm_configured",
+                model=settings.backup_llm.MODEL_NAME,
+                api_url=settings.backup_llm.API_URL,
+            )
+
         self._logger.info(
             "llm_adapter_initialized",
-            model   = self._model_name,
-            api_url = self._settings.API_URL,
+            model=self._model_name,
+            api_url=self._api_url,
         )
 
     def generate(
@@ -131,8 +168,25 @@ class LLMAdapter(BaseLLMAdapter):
     ) -> LLMResponse:
         """
         Send conversation to LLM. Retries on server errors.
-        Raises LLMAdapterError after all retries exhausted.
+        If primary fails and a backup adapter is configured, falls back automatically.
         """
+        try:
+            return self._execute_generate(messages, tools)
+        except Exception as e:
+            if self._backup_adapter:
+                self._logger.warning(
+                    "primary_llm_failed_switching_to_backup",
+                    error=str(e),
+                    backup_model=self._backup_adapter.model_name,
+                )
+                return self._backup_adapter.generate(messages, tools)
+            raise
+
+    def _execute_generate(
+        self,
+        messages: list[ChatMessage],
+        tools:    list[ToolSchema] | None = None,
+    ) -> LLMResponse:
         if not self._health.is_available:
             raise LLMAdapterError("LLM endpoint in cooldown. Try again shortly.")
 
@@ -141,18 +195,18 @@ class LLMAdapter(BaseLLMAdapter):
         last_error: str | None = None
         start = time.monotonic()
 
-        for attempt in range(1, self._settings.MAX_RETRIES + 1):
+        for attempt in range(1, self._max_retries + 1):
             try:
-                with httpx.Client(timeout=self._settings.TIMEOUT_SECONDS) as client:
-                    resp = client.post(self._settings.API_URL, headers=headers, json=payload)
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    resp = client.post(self._api_url, headers=headers, json=payload)
 
                 if resp.status_code >= 400:
-                    last_error = f"http_{resp.status_code}"
+                    last_error = f"http_{resp.status_code}: {resp.text[:200]}"
                     if 400 <= resp.status_code < 500:
                         self._health.mark_failed()
                         break
-                    if attempt < self._settings.MAX_RETRIES:
-                        time.sleep(self._settings.RETRY_DELAY_SECONDS)
+                    if attempt < self._max_retries:
+                        time.sleep(self._retry_delay_seconds)
                     continue
 
                 self._health.mark_healthy()
@@ -161,18 +215,18 @@ class LLMAdapter(BaseLLMAdapter):
             except httpx.TimeoutException:
                 last_error = "timeout"
                 self._health.mark_failed()
-                if attempt < self._settings.MAX_RETRIES:
-                    time.sleep(self._settings.RETRY_DELAY_SECONDS)
+                if attempt < self._max_retries:
+                    time.sleep(self._retry_delay_seconds)
 
             except httpx.RequestError as e:
                 last_error = str(e)
                 self._health.mark_failed()
-                if attempt < self._settings.MAX_RETRIES:
-                    time.sleep(self._settings.RETRY_DELAY_SECONDS)
+                if attempt < self._max_retries:
+                    time.sleep(self._retry_delay_seconds)
 
         self._logger.error(
             "llm_generate_failed",
-            attempts   = self._settings.MAX_RETRIES,
+            attempts   = self._max_retries,
             last_error = last_error,
             duration   = round(time.monotonic() - start, 3),
         )
@@ -187,8 +241,8 @@ class LLMAdapter(BaseLLMAdapter):
         payload = self._build_payload(messages, tools, stream=True)
         headers = self._build_headers()
         try:
-            with httpx.Client(timeout=self._settings.TIMEOUT_SECONDS) as client:
-                with client.stream("POST", self._settings.API_URL, headers=headers, json=payload) as response:
+            with httpx.Client(timeout=self._timeout_seconds) as client:
+                with client.stream("POST", self._api_url, headers=headers, json=payload) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
                         chunk = self._parse_stream_chunk(line)
@@ -218,10 +272,14 @@ class LLMAdapter(BaseLLMAdapter):
         return payload
 
     def _build_headers(self) -> dict[str, str]:
-        return {
+        headers = {
             "Content-Type" : "application/json",
-            "Authorization": f"Bearer {self._settings.AUTH_TOKEN}",
+            "Authorization": f"Bearer {self._auth_token}",
         }
+        if "openrouter.ai" in self._api_url:
+            headers["HTTP-Referer"] = "https://github.com/manas-099/AXON"
+            headers["X-Title"] = "AXON File System Agent"
+        return headers
 
     def _parse_response(self, data: dict[str, Any]) -> LLMResponse:
         """Parse raw API JSON into LLMResponse domain object."""
