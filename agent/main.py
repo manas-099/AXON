@@ -8,6 +8,12 @@ Type 'exit' or 'quit' to stop.
 Type 'clear' to reset conversation history.
 """
 
+import sys
+from pathlib import Path
+
+# Ensure project root is in sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from agent.agent_loop import AgentLoop
 from agent.logger import get_logger
 
