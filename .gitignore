@@ -13,3 +13,6 @@ backups/
 *.swp
 *.egg-info/
 dist/
+
+# Meta prompts
+meta_prompt*.md
