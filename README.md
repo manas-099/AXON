@@ -10,7 +10,6 @@ full structured control over your Windows file system.
 
 ## Architecture
 
-Built with **Clean Architecture** — strict separation of concerns:
 
 ```
 tools/      ← MCP interface layer    (what the LLM sees and calls)
@@ -83,4 +82,3 @@ uv run python main.py
 ---
 
 
-``
